@@ -10,6 +10,8 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD)
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 BUILD_USER := $(USER)@$(HOSTNAME)
 BUILD_DATE := $(shell date +"%FT%T")
+BINARY := netgear_cm_exporter
+IMAGE := dnesting/$(BINARY)
 
 # go command flags
 export GO111MODULE=on
@@ -49,3 +51,19 @@ prereq:
 
 clean:
 	rm -f $(BINARY)
+
+docker:
+	docker buildx build \
+		-t $(IMAGE):$(VERSION) \
+		-t $(IMAGE):latest \
+		--load \
+		.
+
+# multi arch
+push:
+	docker buildx build \
+		--platform linux/amd64,linux/arm64 \
+		-t $(IMAGE):$(VERSION) \
+		-t $(IMAGE):latest \
+		--push \
+		.

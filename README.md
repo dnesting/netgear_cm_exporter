@@ -1,5 +1,9 @@
 # Netgear Cable Modem Exporter
 
+This fork makes this exporter work with my CM1200 as of 2024-04-28.  It needed changes to the authentication and fixing some of the metrics.
+
+---
+
 [![Go Report Card](https://goreportcard.com/badge/github.com/ickymettle/netgear_cm_exporter)](https://goreportcard.com/report/github.com/ickymettle/netgear_cm_exporter)
 
 This project is now archived, unfortunately I no longer have access to a Netgear CMxxx series modem
