@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: cm-exporter
+  name: cm-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cm-exporter
+  template:
+    metadata:
+      labels:
+        app: cm-exporter
+    spec:
+      containers:
+      - image: dnesting/netgear_cm_exporter:latest
+        imagePullPolicy: Always
+        name: cm-exporter
+        args:
+        - --config.file=/config/config.yaml
+        ports:
+        - containerPort: 9527
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        resources:
+          limits:
+            cpu: "0.1"
+            memory: "100M"
+      volumes:
+      - name: config
+        secret:
+          secretName: cm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    app: cm-exporter
+  name: cm-exporter
+spec:
+  ports:
+  - name: metrics
+    port: 9527
+    protocol: TCP
+    targetPort: 9527
+  selector:
+    app: cm-exporter
+  type: ClusterIP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cm-exporter
+spec:
+  selector:
+    matchLabels:
+      app: cm-exporter
+  endpoints:
+  - port: metrics

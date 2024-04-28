@@ -1,2 +1,3 @@
 /netgear_cm_exporter
 /netgear_cm_exporter.yml
+*.secret.yaml
