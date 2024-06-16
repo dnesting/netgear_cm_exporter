@@ -5,11 +5,13 @@ COPY . .
 
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
+ARG LDFLAGS
 
 RUN go env -w GOARCH=$(echo $TARGETPLATFORM | cut -d / -f2)
 RUN go env -w GOOS=$(echo $TARGETPLATFORM | cut -d / -f1)
+
 RUN go mod download
-RUN go build -o netgear_cm_exporter
+RUN go build -ldflags "${LDFLAGS}" -o netgear_cm_exporter
 
 FROM --platform=$TARGETPLATFORM alpine:3.13
 COPY --from=build /src/netgear_cm_exporter /netgear_cm_exporter

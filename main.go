@@ -30,6 +30,7 @@ var (
 
 // Exporter represents an instance of the Netgear cable modem exporter.
 type Exporter struct {
+	addr    string
 	baseUrl string
 	// authHeaderValue string
 	username, password string
@@ -40,6 +41,13 @@ type Exporter struct {
 	// Exporter metrics.
 	totalScrapes prometheus.Counter
 	scrapeErrors prometheus.Counter
+
+	versionInfo *prometheus.Desc
+
+	// Reachability
+	httpUp    *prometheus.Desc
+	pingUp    *prometheus.GaugeVec
+	pingTimes *prometheus.HistogramVec
 
 	// State metrics
 	stateConnected      *prometheus.Desc
@@ -61,25 +69,18 @@ type Exporter struct {
 	usChannelSymbolRate *prometheus.Desc
 }
 
-// basicAuth returns the base64 encoding of the username and password
-// separated by a colon. Borrowed the net/http package.
-//func basicAuth(username, password string) string {
-//	auth := fmt.Sprintf("%s:%s", username, password)
-//	return base64.StdEncoding.EncodeToString([]byte(auth))
-//}
-
 // NewExporter returns an instance of Exporter configured with the modem's
 // address, admin username and password.
 func NewExporter(addr, username, password string) *Exporter {
 	var (
-		dsLabelNames = []string{"type", "channel", "lock_status", "modulation", "channel_id", "frequency"}
-		usLabelNames = []string{"type", "channel", "lock_status", "channel_type", "channel_id", "frequency"}
+		dsLabelNames = []string{"serial", "mac", "type", "channel", "lock_status", "modulation", "channel_id", "frequency"}
+		usLabelNames = []string{"serial", "mac", "type", "channel", "lock_status", "channel_type", "channel_id", "frequency"}
 	)
 
 	return &Exporter{
 		// Modem access details.
-		baseUrl: "http://" + addr,
-		//authHeaderValue: "Basic " + basicAuth(username, password),
+		addr:     addr,
+		baseUrl:  "http://" + addr,
 		username: username,
 		password: password,
 
@@ -95,31 +96,60 @@ func NewExporter(addr, username, password string) *Exporter {
 			Help:      "Total number of failed scrapes of the modem status page.",
 		}),
 
+		versionInfo: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "", "info"),
+			"A metric with a constant '1' value labeled by hardware and firmware version",
+			[]string{"hw_version", "fw_version", "serial"}, nil,
+		),
+
+		// Reachability
+		pingUp: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: "reachable",
+				Name:      "ping_up",
+				Help:      "The cable modem is responding to ICMP pings",
+			},
+			[]string{"target"},
+		),
+		httpUp: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reachable", "http_up"),
+			"The cable modem could be connected to",
+			[]string{"target"}, nil,
+		),
+		pingTimes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: "reachable",
+			Name:      "ping_time_seconds",
+			Help:      "Ping time in seconds",
+			Buckets:   []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+		}, nil),
+
 		// State metrics
 		stateConnected: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "connected"),
 			"The cable modem reports being connected",
-			nil, nil,
+			[]string{"serial"}, nil,
 		),
 		stateBooted: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "booted"),
 			"The cable modem reports being booted",
-			[]string{"file"}, nil,
+			[]string{"serial", "file"}, nil,
 		),
 		stateSecured: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "secured"),
 			"The cable modem reports security is enabled",
-			[]string{"mode"}, nil,
+			[]string{"serial", "mode"}, nil,
 		),
 		stateIPProvisioning: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "ip_provisioning"),
 			"The cable modem reports the IP provisioning mode",
-			[]string{"mode"}, nil,
+			[]string{"serial", "mode"}, nil,
 		),
 		uptime: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "uptime_secs"),
 			"The cable modem reports the uptime in seconds",
-			nil, nil,
+			[]string{"serial"}, nil,
 		),
 
 		// Downstream metrics.
@@ -168,6 +198,10 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	// Exporter metrics.
 	ch <- e.totalScrapes.Desc()
 	ch <- e.scrapeErrors.Desc()
+	// Reachability metrics
+	e.pingUp.Describe(ch)
+	ch <- e.httpUp
+	e.pingTimes.Describe(ch)
 	// State metrics
 	ch <- e.stateConnected
 	ch <- e.stateBooted
@@ -210,11 +244,12 @@ GET /DocsisStatus.asp
 
 // getLoginData retrieves /GenieLogin.asp, and returns the form data
 // derived from the configured username, password, and the webToken value from the form.
-func (e *Exporter) cmGetLoginForm() (postUrl string, loginData map[string]string, err error) {
+func (e *Exporter) cmGetLoginForm() (postUrl string, loginData map[string]string, httpOk bool, err error) {
 	c := colly.NewCollector()
 
 	loginData = make(map[string]string)
 	c.OnHTML(`form[name="login"]`, func(elem *colly.HTMLElement) {
+		httpOk = true
 		elem.ForEach("input", func(_ int, el *colly.HTMLElement) {
 			loginData[el.Attr("name")] = el.Attr("value")
 		})
@@ -229,19 +264,21 @@ func (e *Exporter) cmGetLoginForm() (postUrl string, loginData map[string]string
 	})
 
 	c.OnError(func(r *colly.Response, err2 error) {
+		httpOk = r.StatusCode > 0
 		err = err2
 		log.Printf("failed to get login data: %d %s (err=%v)", r.StatusCode, http.StatusText(r.StatusCode), err)
 	})
 
 	c.Visit(e.baseUrl + "/GenieLogin.asp")
-	return postUrl, loginData, err
+	return postUrl, loginData, httpOk, err
 }
 
-func (e *Exporter) cmLogin(postUrl string, loginData map[string]string) (sessionId string, err error) {
+func (e *Exporter) cmLogin(postUrl string, loginData map[string]string) (sessionId string, httpOk bool, err error) {
 	c := colly.NewCollector()
 
 	c.OnError(func(r *colly.Response, err2 error) {
 		err = err2
+		httpOk = r.StatusCode > 0
 		log.Printf("failed to authenticate: %d %s (err=%v)", r.StatusCode, http.StatusText(r.StatusCode), err)
 	})
 
@@ -251,6 +288,7 @@ func (e *Exporter) cmLogin(postUrl string, loginData map[string]string) (session
 
 	c.OnResponse(func(r *colly.Response) {
 		sessionId = r.Headers.Get("Set-Cookie")
+		httpOk = r.StatusCode > 0
 
 		// Extract the SessionID value from the cookie.
 		if i := strings.Index(sessionId, "SessionID="); i != -1 {
@@ -266,47 +304,30 @@ func (e *Exporter) cmLogin(postUrl string, loginData map[string]string) (session
 	})
 
 	c.Post(postUrl, loginData)
-	return sessionId, err
+	return sessionId, httpOk, err
 }
 
-// logout visits /Logout.aspx with the session cookie and expects a 200
-// func (e *Exporter) logout(sessionId string) (err error) {
-// c := colly.NewCollector()
-//
-// c.OnError(func(r *colly.Response, err2 error) {
-// err = err2
-// log.Printf("failed to logout: %d %s (err=%v)", r.StatusCode, http.StatusText(r.StatusCode), err)
-// })
-//
-// c.OnRequest(func(r *colly.Request) {
-// r.Headers.Add("Cookie", "SessionID="+sessionId)
-// })
-//
-// c.Visit(e.baseUrl + "/Logout.asp")
-// return err
-// }
-
-func (e *Exporter) authenticate() (sessionId string, err error) {
+func (e *Exporter) authenticate() (sessionId string, httpOk bool, err error) {
 	var postUrl string
 	var loginData map[string]string
 	log.Printf("auth: authenticating as %s...", e.username)
 
-	postUrl, loginData, err = e.cmGetLoginForm()
+	postUrl, loginData, httpOk, err = e.cmGetLoginForm()
 	if err != nil {
-		return "", err
+		return "", httpOk, err
 	}
 	loginKeys := make([]string, 0, len(loginData))
 	for k := range loginData {
 		loginKeys = append(loginKeys, k)
 	}
 	log.Printf("- using form fields: %s fields=%v", postUrl, loginKeys)
-	sessionId, err = e.cmLogin(postUrl, loginData)
+	sessionId, httpOk, err = e.cmLogin(postUrl, loginData)
 	if err != nil {
 		log.Printf("auth: %v", err)
-		return "", err
+		return "", httpOk, err
 	}
 	log.Printf("auth: success: %s", sessionId)
-	return sessionId, nil
+	return sessionId, true, nil
 }
 
 // Collect runs our scrape loop returning each Prometheus metric.
@@ -316,21 +337,22 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	var httpOk bool
 	var err error
 	if e.sessionId != "" {
 		log.Printf("auth: using existing session: %s", e.sessionId)
-		err = e.collectDocsis(ch)
+		httpOk, err = e.collectAll(ch)
 		if err != nil {
 			log.Printf("collect: %v (will re-authenticate)", err)
 			e.sessionId = ""
 		}
 	}
 	if e.sessionId == "" {
-		e.sessionId, err = e.authenticate()
+		e.sessionId, httpOk, err = e.authenticate()
 		if err != nil {
 			e.sessionId = ""
 		} else {
-			if err = e.collectDocsis(ch); err != nil {
+			if httpOk, err = e.collectAll(ch); err != nil {
 				e.sessionId = ""
 			}
 		}
@@ -341,11 +363,19 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		e.scrapeErrors.Inc()
 	}
 
+	httpOkFloat := 0.0
+	if httpOk {
+		httpOkFloat = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(e.httpUp, prometheus.GaugeValue, httpOkFloat, e.addr)
+
+	e.pingUp.Collect(ch)
+	e.pingTimes.Collect(ch)
 	e.totalScrapes.Collect(ch)
 	e.scrapeErrors.Collect(ch)
 }
 
-func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
+func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
 	// Rows have 3 columns: Procedure, Status, Comment
 	// We will extract the the Status value for these Procedures:
 	// - Connectivity State --> connected=1
@@ -382,7 +412,7 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			if status == "OK" {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateConnected, prometheus.GaugeValue, value)
+			ch <- prometheus.MustNewConstMetric(e.stateConnected, prometheus.GaugeValue, value, modemInfo.SerialNumber)
 		case "Boot State":
 			if status == "OK" {
 				bootState = true
@@ -392,21 +422,21 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			if bootState {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, note)
+			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, modemInfo.SerialNumber, note)
 		case "Security":
 			value := 0.0
 			if status == "Enable" {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateSecured, prometheus.GaugeValue, value, note)
+			ch <- prometheus.MustNewConstMetric(e.stateSecured, prometheus.GaugeValue, value, modemInfo.SerialNumber, note)
 		case "IP Provisioning Mode":
-			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, 1.0, status)
+			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, 1.0, modemInfo.SerialNumber, status)
 		}
 	})
 	return ok
 }
 
-func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
+func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
 	ok := false
 	offset := 0
 	if kind == "OFDM" {
@@ -459,7 +489,7 @@ func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, 
 				fmt.Sscanf(text, "%f", &cwUncorrected)
 			}
 		})
-		labels := []string{kind, channel, lockStatus, modulation, channelID, freqMHz}
+		labels := []string{modemInfo.SerialNumber, modemInfo.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
 
 		ch <- prometheus.MustNewConstMetric(e.dsChannelSNR, prometheus.GaugeValue, snr, labels...)
 		ch <- prometheus.MustNewConstMetric(e.dsChannelPower, prometheus.GaugeValue, power, labels...)
@@ -470,7 +500,7 @@ func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, 
 	return ok
 }
 
-func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
+func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
 	ok := false
 	elem.DOM.Find("tr").Each(func(i int, row *goquery.Selection) {
 		if i == 0 {
@@ -506,7 +536,7 @@ func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch
 				fmt.Sscanf(text, "%f dBmV", &power)
 			}
 		})
-		labels := []string{kind, channel, lockStatus, modulation, channelID, freqMHz}
+		labels := []string{modemInfo.SerialNumber, modemInfo.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
 
 		ch <- prometheus.MustNewConstMetric(e.usChannelPower, prometheus.GaugeValue, power, labels...)
 	})
@@ -526,7 +556,18 @@ func parseDuration(dur string) (time.Duration, error) {
 	return time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(s)*time.Second, nil
 }
 
-func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
+func (e *Exporter) collectAll(ch chan<- prometheus.Metric) (httpOk bool, err error) {
+	var modemInfo ModemInfo
+	if modemInfo, httpOk, err = e.collectModemInfo(ch); err != nil {
+		return httpOk, err
+	}
+	if httpOk, err = e.collectDocsis(ch, modemInfo); err != nil {
+		return httpOk, err
+	}
+	return httpOk, nil
+}
+
+func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInfo) (httpOk bool, err error) {
 	c := colly.NewCollector()
 
 	// OnRequest callback adds basic auth header.
@@ -538,12 +579,13 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 	// OnError callback counts any errors that occur during scraping.
 	c.OnError(func(r *colly.Response, err2 error) {
 		err = err2
+		httpOk = r.StatusCode > 0
 		log.Printf("scrape failed: %d %s (err=%v)", r.StatusCode, http.StatusText(r.StatusCode), err)
 	})
 
 	gotData := false
 	c.OnHTML(`#startup_procedure_table tbody`, func(elem *colly.HTMLElement) {
-		gotData = e.collectTableState(elem, ch)
+		gotData = e.collectTableState(elem, ch, modemInfo)
 		if !gotData {
 			log.Println("no data found in startup_procedure_table")
 		}
@@ -551,14 +593,14 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 
 	// Callback to parse the tbody block of table with id=dsTable, the downstream table info.
 	c.OnHTML(`#dsTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableDownstream("bonded", elem, ch) {
+		if e.collectTableDownstream("bonded", elem, ch, modemInfo) {
 			gotData = true
 		} else {
 			log.Println("no data found in dsTable")
 		}
 	})
 	c.OnHTML(`#d31dsTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableDownstream("OFDM", elem, ch) {
+		if e.collectTableDownstream("OFDM", elem, ch, modemInfo) {
 			gotData = true
 		} else {
 			log.Println("no data found in d31dsTable")
@@ -567,7 +609,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 
 	// Callback to parse the tbody block of table with id=usTable, the upstream channel info.
 	c.OnHTML(`#usTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableUpstream("bonded", elem, ch) {
+		if e.collectTableUpstream("bonded", elem, ch, modemInfo) {
 			gotData = true
 		} else {
 			log.Println("no data found in usTable")
@@ -575,7 +617,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 	})
 
 	c.OnHTML(`#d31usTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableUpstream("OFDM", elem, ch) {
+		if e.collectTableUpstream("OFDM", elem, ch, modemInfo) {
 			gotData = true
 		} else {
 			log.Println("no data found in d31usTable")
@@ -595,7 +637,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 		if err != nil {
 			log.Printf("failed to parse uptime %v: %v", matches[1], err)
 		} else {
-			ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.GaugeValue, d.Seconds())
+			ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.GaugeValue, d.Seconds(), modemInfo.SerialNumber)
 		}
 	})
 
@@ -606,13 +648,79 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (err error) {
 		}
 	})
 
+	c.OnResponse(func(r *colly.Response) {
+		httpOk = r.StatusCode > 0
+	})
+
 	u := e.baseUrl + "/DocsisStatus.asp"
 	log.Printf("visiting %s", u)
 	c.Visit(u)
 	if err == nil && !gotData {
 		err = fmt.Errorf("no data found")
 	}
-	return err
+	return httpOk, err
+}
+
+type ModemInfo struct {
+	HwVersion            string
+	SwVersion            string
+	SerialNumber         string
+	CertificateInstalled bool
+	MacAddress           string
+}
+
+func (e *Exporter) collectModemInfo(ch chan<- prometheus.Metric) (modemInfo ModemInfo, httpOk bool, err error) {
+	var gotData bool
+	c := colly.NewCollector()
+
+	// OnRequest callback adds basic auth header.
+	c.OnRequest(func(r *colly.Request) {
+		r.Headers.Add("Cookie", "SessionID="+e.sessionId)
+		//r.Headers.Add("Authorization", e.authHeaderValue)
+	})
+
+	// OnError callback counts any errors that occur during scraping.
+	c.OnError(func(r *colly.Response, err2 error) {
+		err = err2
+		httpOk = r.StatusCode > 0
+		log.Printf("scrape failed: %d %s (err=%v)", r.StatusCode, http.StatusText(r.StatusCode), err)
+	})
+
+	c.OnHTML(`script`, func(elem *colly.HTMLElement) {
+		re := regexp.MustCompile(`var tagValueList = '([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)`)
+		text := elem.Text
+		matches := re.FindStringSubmatch(text)
+		if len(matches) != 6 {
+			return
+		}
+		modemInfo.HwVersion = matches[1]
+		modemInfo.SwVersion = matches[2]
+		modemInfo.SerialNumber = matches[3]
+		modemInfo.CertificateInstalled = matches[4] == "Installed"
+		modemInfo.MacAddress = matches[5]
+		gotData = true
+
+		ch <- prometheus.MustNewConstMetric(e.versionInfo, prometheus.GaugeValue, 1.0, modemInfo.HwVersion, modemInfo.SwVersion, modemInfo.SerialNumber)
+	})
+
+	//c.OnHTML(`html`, func(elem *colly.HTMLElement) {
+	//	if !gotData {
+	//		// print the entire HTML for debugging
+	//		log.Printf("no data found: %s", elem.Text)
+	//	}
+	//})
+
+	c.OnResponse(func(r *colly.Response) {
+		httpOk = r.StatusCode > 0
+	})
+
+	u := e.baseUrl + "/RouterStatus.asp"
+	log.Printf("visiting %s", u)
+	c.Visit(u)
+	if err == nil && !gotData {
+		err = fmt.Errorf("no data found")
+	}
+	return modemInfo, httpOk, err
 }
 
 func main() {
@@ -622,11 +730,13 @@ func main() {
 	)
 	flag.Parse()
 
+	versionMsg := fmt.Sprintf("netgear_cm_exporter version=%s revision=%s branch=%s buildUser=%s buildDate=%s\n",
+		version, revision, branch, buildUser, buildDate)
 	if *showVersion {
-		fmt.Printf("netgear_cm_exporter version=%s revision=%s branch=%s buildUser=%s buildDate=%s\n",
-			version, revision, branch, buildUser, buildDate)
+		fmt.Print(versionMsg)
 		os.Exit(0)
 	}
+	log.Print(versionMsg)
 
 	config, err := NewConfigFromFile(*configFile)
 	if err != nil {
@@ -634,13 +744,20 @@ func main() {
 	}
 
 	exporter := NewExporter(config.Modem.Address, config.Modem.Username, config.Modem.Password)
-
 	prometheus.MustRegister(exporter)
 
 	http.Handle(config.Telemetry.MetricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, config.Telemetry.MetricsPath, http.StatusMovedPermanently)
 	})
+
+	if config.Modem.PingEvery != "" {
+		dur, err := time.ParseDuration(config.Modem.PingEvery)
+		if err != nil {
+			log.Fatalf("Invalid duration in %s modem ping-every: %v", *configFile, config.Modem.PingEvery)
+		}
+		go exporter.pingLoop(dur, 5*time.Second, 30*time.Second)
+	}
 
 	log.Printf("exporter listening on %s", config.Telemetry.ListenAddress)
 	if err := http.ListenAndServe(config.Telemetry.ListenAddress, nil); err != nil {

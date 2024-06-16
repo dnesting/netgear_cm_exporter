@@ -1,6 +1,6 @@
 # Netgear Cable Modem Exporter
 
-This fork makes this exporter work with my CM1200 as of 2024-04-28.  It needed changes to the authentication and fixing some of the metrics.
+This fork makes this exporter work with my CM1000 as of 2024-04-28.  It needed changes to the authentication and fixing some of the metrics.  The rest of this README is the original from the (archived) original.
 
 ---
 

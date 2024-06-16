@@ -10,9 +10,10 @@ import (
 
 // Modem represents the address of the modem and its admin credentials.
 type Modem struct {
-	Address  string `yaml:"address"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Address   string `yaml:"address"`
+	Username  string `yaml:"username"`
+	Password  string `yaml:"password"`
+	PingEvery string `yaml:"ping-every"`
 }
 
 // Telemetry represents the exporter's listen address and metrics URI path.
