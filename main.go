@@ -415,6 +415,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	e.pingUp.Collect(ch)
 	e.pingTimes.Collect(ch)
+	e.pingTime.Collect(ch)
 	e.totalScrapes.Collect(ch)
 	e.scrapeErrors.Collect(ch)
 }
