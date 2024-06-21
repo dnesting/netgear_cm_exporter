@@ -36,6 +36,11 @@ type Exporter struct {
 	username, password string
 	sessionId          string
 
+	// Cache unchanging data for labels
+	modemID        ModemID
+	gotModemIDOnce sync.Once
+	gotModemID     chan struct{}
+
 	mu sync.Mutex
 
 	// Exporter metrics.
@@ -48,12 +53,14 @@ type Exporter struct {
 	httpUp    *prometheus.Desc
 	pingUp    *prometheus.GaugeVec
 	pingTimes *prometheus.HistogramVec
+	pingTime  *prometheus.GaugeVec
 
 	// State metrics
 	stateConnected      *prometheus.Desc
 	stateBooted         *prometheus.Desc
 	stateSecured        *prometheus.Desc
 	stateIPProvisioning *prometheus.Desc
+	stateCertInstalled  *prometheus.Desc
 
 	uptime *prometheus.Desc
 
@@ -84,6 +91,8 @@ func NewExporter(addr, username, password string) *Exporter {
 		username: username,
 		password: password,
 
+		gotModemID: make(chan struct{}),
+
 		// Collection metrics.
 		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -99,7 +108,7 @@ func NewExporter(addr, username, password string) *Exporter {
 		versionInfo: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "info"),
 			"A metric with a constant '1' value labeled by hardware and firmware version",
-			[]string{"hw_version", "fw_version", "serial"}, nil,
+			[]string{"hw_version", "fw_version", "serial", "mac"}, nil,
 		),
 
 		// Reachability
@@ -110,46 +119,62 @@ func NewExporter(addr, username, password string) *Exporter {
 				Name:      "ping_up",
 				Help:      "The cable modem is responding to ICMP pings",
 			},
-			[]string{"target"},
+			[]string{"target", "serial", "mac"},
 		),
 		httpUp: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "reachable", "http_up"),
 			"The cable modem could be connected to",
-			[]string{"target"}, nil,
+			[]string{"target", "serial", "mac"}, nil,
 		),
-		pingTimes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Namespace: namespace,
-			Subsystem: "reachable",
-			Name:      "ping_time_seconds",
-			Help:      "Ping time in seconds",
-			Buckets:   []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
-		}, nil),
+		pingTimes: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Namespace: namespace,
+				Subsystem: "reachable",
+				Name:      "ping_time_seconds",
+				Help:      "Ping time in seconds",
+				Buckets:   []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+			},
+			[]string{"target", "serial", "mac"}),
+		pingTime: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: "reachable",
+				Name:      "last_ping_time_seconds",
+				Help:      "Last ping time in seconds",
+			},
+			[]string{"target", "serial", "mac"},
+		),
 
 		// State metrics
 		stateConnected: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "connected"),
 			"The cable modem reports being connected",
-			[]string{"serial"}, nil,
+			[]string{"serial", "mac"}, nil,
 		),
 		stateBooted: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "booted"),
 			"The cable modem reports being booted",
-			[]string{"serial", "file"}, nil,
+			[]string{"serial", "mac", "file"}, nil,
 		),
 		stateSecured: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "secured"),
 			"The cable modem reports security is enabled",
-			[]string{"serial", "mode"}, nil,
+			[]string{"serial", "mac", "mode"}, nil,
 		),
 		stateIPProvisioning: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "ip_provisioning"),
 			"The cable modem reports the IP provisioning mode",
-			[]string{"serial", "mode"}, nil,
+			[]string{"serial", "mac", "mode"}, nil,
+		),
+		stateCertInstalled: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "state", "cert_installed"),
+			"The cable modem reports a certificate is installed",
+			[]string{"serial", "mac"}, nil,
 		),
 		uptime: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "uptime_secs"),
 			"The cable modem reports the uptime in seconds",
-			[]string{"serial"}, nil,
+			[]string{"serial", "mac"}, nil,
 		),
 
 		// Downstream metrics.
@@ -202,11 +227,13 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	e.pingUp.Describe(ch)
 	ch <- e.httpUp
 	e.pingTimes.Describe(ch)
+	e.pingTime.Describe(ch)
 	// State metrics
 	ch <- e.stateConnected
 	ch <- e.stateBooted
 	ch <- e.stateSecured
 	ch <- e.stateIPProvisioning
+	ch <- e.stateCertInstalled
 	ch <- e.uptime
 	// Downstream metrics.
 	ch <- e.dsChannelSNR
@@ -339,24 +366,28 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	var httpOk bool
 	var err error
-	if e.sessionId != "" {
-		log.Printf("auth: using existing session: %s", e.sessionId)
+	e.callAuthenticated(func() error {
 		httpOk, err = e.collectAll(ch)
-		if err != nil {
-			log.Printf("collect: %v (will re-authenticate)", err)
-			e.sessionId = ""
-		}
-	}
-	if e.sessionId == "" {
-		e.sessionId, httpOk, err = e.authenticate()
-		if err != nil {
-			e.sessionId = ""
-		} else {
-			if httpOk, err = e.collectAll(ch); err != nil {
-				e.sessionId = ""
-			}
-		}
-	}
+		return err
+	})
+	//	if e.sessionId != "" {
+	//		log.Printf("auth: using existing session: %s", e.sessionId)
+	//		httpOk, err = e.collectAll(ch)
+	//		if err != nil {
+	//			log.Printf("collect: %v (will re-authenticate)", err)
+	//			e.sessionId = ""
+	//		}
+	//	}
+	//	if e.sessionId == "" {
+	//		e.sessionId, httpOk, err = e.authenticate()
+	//		if err != nil {
+	//			e.sessionId = ""
+	//		} else {
+	//			if httpOk, err = e.collectAll(ch); err != nil {
+	//				e.sessionId = ""
+	//			}
+	//		}
+	//	}
 
 	if e.sessionId == "" {
 		log.Printf("unable to scrape")
@@ -367,7 +398,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if httpOk {
 		httpOkFloat = 1.0
 	}
-	ch <- prometheus.MustNewConstMetric(e.httpUp, prometheus.GaugeValue, httpOkFloat, e.addr)
+	ch <- prometheus.MustNewConstMetric(e.httpUp, prometheus.GaugeValue, httpOkFloat, e.addr, e.modemID.SerialNumber, e.modemID.MacAddress)
 
 	e.pingUp.Collect(ch)
 	e.pingTimes.Collect(ch)
@@ -375,7 +406,30 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.scrapeErrors.Collect(ch)
 }
 
-func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
+func (e *Exporter) callAuthenticated(fn func() error) (httpOk bool, err error) {
+	if e.sessionId != "" {
+		log.Printf("auth: using existing session: %s", e.sessionId)
+
+		err = fn()
+		if err != nil {
+			log.Printf("auth: %v (will try to re-authenticate)", err)
+			e.sessionId = ""
+		}
+	}
+	if e.sessionId == "" {
+		e.sessionId, httpOk, err = e.authenticate()
+		if err != nil {
+			e.sessionId = ""
+		} else {
+			if err = fn(); err != nil {
+				e.sessionId = ""
+			}
+		}
+	}
+	return
+}
+
+func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
 	// Rows have 3 columns: Procedure, Status, Comment
 	// We will extract the the Status value for these Procedures:
 	// - Connectivity State --> connected=1
@@ -412,7 +466,7 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			if status == "OK" {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateConnected, prometheus.GaugeValue, value, modemInfo.SerialNumber)
+			ch <- prometheus.MustNewConstMetric(e.stateConnected, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress)
 		case "Boot State":
 			if status == "OK" {
 				bootState = true
@@ -422,21 +476,21 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			if bootState {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, modemInfo.SerialNumber, note)
+			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, note)
 		case "Security":
 			value := 0.0
 			if status == "Enable" {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateSecured, prometheus.GaugeValue, value, modemInfo.SerialNumber, note)
+			ch <- prometheus.MustNewConstMetric(e.stateSecured, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, note)
 		case "IP Provisioning Mode":
-			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, 1.0, modemInfo.SerialNumber, status)
+			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, 1.0, e.modemID.SerialNumber, e.modemID.MacAddress, status)
 		}
 	})
 	return ok
 }
 
-func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
+func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
 	ok := false
 	offset := 0
 	if kind == "OFDM" {
@@ -489,7 +543,7 @@ func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, 
 				fmt.Sscanf(text, "%f", &cwUncorrected)
 			}
 		})
-		labels := []string{modemInfo.SerialNumber, modemInfo.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
+		labels := []string{e.modemID.SerialNumber, e.modemID.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
 
 		ch <- prometheus.MustNewConstMetric(e.dsChannelSNR, prometheus.GaugeValue, snr, labels...)
 		ch <- prometheus.MustNewConstMetric(e.dsChannelPower, prometheus.GaugeValue, power, labels...)
@@ -500,7 +554,7 @@ func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, 
 	return ok
 }
 
-func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric, modemInfo ModemInfo) bool {
+func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch chan<- prometheus.Metric) bool {
 	ok := false
 	elem.DOM.Find("tr").Each(func(i int, row *goquery.Selection) {
 		if i == 0 {
@@ -536,7 +590,7 @@ func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch
 				fmt.Sscanf(text, "%f dBmV", &power)
 			}
 		})
-		labels := []string{modemInfo.SerialNumber, modemInfo.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
+		labels := []string{e.modemID.SerialNumber, e.modemID.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
 
 		ch <- prometheus.MustNewConstMetric(e.usChannelPower, prometheus.GaugeValue, power, labels...)
 	})
@@ -557,17 +611,16 @@ func parseDuration(dur string) (time.Duration, error) {
 }
 
 func (e *Exporter) collectAll(ch chan<- prometheus.Metric) (httpOk bool, err error) {
-	var modemInfo ModemInfo
-	if modemInfo, httpOk, err = e.collectModemInfo(ch); err != nil {
+	if httpOk, err = e.collectModemInfo(ch); err != nil {
 		return httpOk, err
 	}
-	if httpOk, err = e.collectDocsis(ch, modemInfo); err != nil {
+	if httpOk, err = e.collectDocsis(ch); err != nil {
 		return httpOk, err
 	}
 	return httpOk, nil
 }
 
-func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInfo) (httpOk bool, err error) {
+func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric) (httpOk bool, err error) {
 	c := colly.NewCollector()
 
 	// OnRequest callback adds basic auth header.
@@ -585,7 +638,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 
 	gotData := false
 	c.OnHTML(`#startup_procedure_table tbody`, func(elem *colly.HTMLElement) {
-		gotData = e.collectTableState(elem, ch, modemInfo)
+		gotData = e.collectTableState(elem, ch)
 		if !gotData {
 			log.Println("no data found in startup_procedure_table")
 		}
@@ -593,14 +646,14 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 
 	// Callback to parse the tbody block of table with id=dsTable, the downstream table info.
 	c.OnHTML(`#dsTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableDownstream("bonded", elem, ch, modemInfo) {
+		if e.collectTableDownstream("bonded", elem, ch) {
 			gotData = true
 		} else {
 			log.Println("no data found in dsTable")
 		}
 	})
 	c.OnHTML(`#d31dsTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableDownstream("OFDM", elem, ch, modemInfo) {
+		if e.collectTableDownstream("OFDM", elem, ch) {
 			gotData = true
 		} else {
 			log.Println("no data found in d31dsTable")
@@ -609,7 +662,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 
 	// Callback to parse the tbody block of table with id=usTable, the upstream channel info.
 	c.OnHTML(`#usTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableUpstream("bonded", elem, ch, modemInfo) {
+		if e.collectTableUpstream("bonded", elem, ch) {
 			gotData = true
 		} else {
 			log.Println("no data found in usTable")
@@ -617,7 +670,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 	})
 
 	c.OnHTML(`#d31usTable tbody`, func(elem *colly.HTMLElement) {
-		if e.collectTableUpstream("OFDM", elem, ch, modemInfo) {
+		if e.collectTableUpstream("OFDM", elem, ch) {
 			gotData = true
 		} else {
 			log.Println("no data found in d31usTable")
@@ -637,7 +690,7 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 		if err != nil {
 			log.Printf("failed to parse uptime %v: %v", matches[1], err)
 		} else {
-			ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.GaugeValue, d.Seconds(), modemInfo.SerialNumber)
+			ch <- prometheus.MustNewConstMetric(e.uptime, prometheus.GaugeValue, d.Seconds(), e.modemID.SerialNumber, e.modemID.MacAddress)
 		}
 	})
 
@@ -661,15 +714,33 @@ func (e *Exporter) collectDocsis(ch chan<- prometheus.Metric, modemInfo ModemInf
 	return httpOk, err
 }
 
-type ModemInfo struct {
-	HwVersion            string
-	SwVersion            string
-	SerialNumber         string
-	CertificateInstalled bool
-	MacAddress           string
+// ModemID represents the modem's "identity" and is presumed not to change.
+type ModemID struct {
+	SerialNumber string
+	MacAddress   string
+	HwVersion    string
 }
 
-func (e *Exporter) collectModemInfo(ch chan<- prometheus.Metric) (modemInfo ModemInfo, httpOk bool, err error) {
+type ModemState struct {
+	SwVersion     string
+	CertInstalled bool
+}
+
+func (e *Exporter) collectModemInfo(ch chan<- prometheus.Metric) (httpOk bool, err error) {
+	modemInfo, httpOk, err := e.retrieveModemInfo()
+
+	var certInstalled float64
+	if modemInfo.CertInstalled {
+		certInstalled = 1.0
+	}
+
+	ch <- prometheus.MustNewConstMetric(e.versionInfo, prometheus.GaugeValue, 1.0, e.modemID.HwVersion, modemInfo.SwVersion, e.modemID.SerialNumber, e.modemID.MacAddress)
+	ch <- prometheus.MustNewConstMetric(e.stateCertInstalled, prometheus.GaugeValue, certInstalled, e.modemID.SerialNumber, e.modemID.MacAddress)
+
+	return httpOk, err
+}
+
+func (e *Exporter) retrieveModemInfo() (modemState ModemState, httpOk bool, err error) {
 	var gotData bool
 	c := colly.NewCollector()
 
@@ -693,14 +764,18 @@ func (e *Exporter) collectModemInfo(ch chan<- prometheus.Metric) (modemInfo Mode
 		if len(matches) != 6 {
 			return
 		}
-		modemInfo.HwVersion = matches[1]
-		modemInfo.SwVersion = matches[2]
-		modemInfo.SerialNumber = matches[3]
-		modemInfo.CertificateInstalled = matches[4] == "Installed"
-		modemInfo.MacAddress = matches[5]
-		gotData = true
 
-		ch <- prometheus.MustNewConstMetric(e.versionInfo, prometheus.GaugeValue, 1.0, modemInfo.HwVersion, modemInfo.SwVersion, modemInfo.SerialNumber)
+		e.modemID.SerialNumber = matches[3]
+		e.modemID.MacAddress = matches[5]
+		e.modemID.HwVersion = matches[1]
+		e.gotModemIDOnce.Do(func() {
+			close(e.gotModemID)
+		})
+
+		modemState.SwVersion = matches[2]
+		modemState.CertInstalled = matches[4] == "Installed"
+
+		gotData = true
 	})
 
 	//c.OnHTML(`html`, func(elem *colly.HTMLElement) {
@@ -720,7 +795,7 @@ func (e *Exporter) collectModemInfo(ch chan<- prometheus.Metric) (modemInfo Mode
 	if err == nil && !gotData {
 		err = fmt.Errorf("no data found")
 	}
-	return modemInfo, httpOk, err
+	return modemState, httpOk, err
 }
 
 func main() {

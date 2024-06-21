@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"math"
@@ -9,15 +10,51 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 )
 
-func (e *Exporter) pingLoop(interval, timeout, unreachableAt time.Duration) {
-	log.Printf("ping: pinging %v every %s", e.addr, interval)
+func (e *Exporter) ensureModemID(ctx context.Context) {
+	e.mu.Lock()
+	select {
+	case <-e.gotModemID:
+	default:
+		var err error
+		log.Printf("ping: collecting modem info")
+		done := make(chan struct{})
+		//go func() {
+		//	_, _, err = e.retrieveModemInfo()
+		//	close(done)
+		//}()
+		go func() {
+			e.callAuthenticated(func() error {
+				_, _, err := e.retrieveModemInfo()
+				return err
+			})
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-e.gotModemID:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		if err != nil {
+			log.Printf("ping: failed to collect modem info, will use blank labels for MAC and serial: %v", err)
+		}
+	}
+	e.mu.Unlock()
+}
 
+func (e *Exporter) pingLoop(interval, timeout, unreachableAt time.Duration) {
 	unreachable := errors.New("no response")
 
 	var errorStart time.Time
 	var determined bool
 	var markedUnreachable bool
-	e.pingUp.WithLabelValues(e.addr).Set(math.NaN())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	e.ensureModemID(ctx)
+	cancel()
+
+	e.pingUp.WithLabelValues(e.addr, e.modemID.SerialNumber, e.modemID.MacAddress).Set(math.NaN())
+
+	log.Printf("ping: pinging %v every %s", e.addr, interval)
 
 	for {
 		pinger, err := probing.NewPinger(e.addr)
@@ -55,11 +92,13 @@ func (e *Exporter) pingLoop(interval, timeout, unreachableAt time.Duration) {
 				errorStart = time.Time{}
 			}
 			if markedUnreachable || !determined {
-				e.pingUp.WithLabelValues(e.addr).Set(1)
+				e.pingUp.WithLabelValues(e.addr, e.modemID.SerialNumber, e.modemID.MacAddress).Set(1)
 				markedUnreachable = false
 				determined = true
 			}
-			e.pingTimes.WithLabelValues().Observe(float64(stats.AvgRtt.Seconds()))
+			secs := float64(stats.AvgRtt.Seconds())
+			e.pingTimes.WithLabelValues(e.addr, e.modemID.SerialNumber, e.modemID.MacAddress).Observe(secs)
+			e.pingTime.WithLabelValues(e.addr, e.modemID.SerialNumber, e.modemID.MacAddress).Set(secs)
 		}
 
 		elapsed := time.Since(start)
