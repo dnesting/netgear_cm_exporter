@@ -14,6 +14,7 @@ spec:
       labels:
         app: cm-exporter
     spec:
+      hostNetwork: true
       containers:
       - image: dnesting/netgear_cm_exporter:latest
         imagePullPolicy: Always
@@ -30,6 +31,9 @@ spec:
           limits:
             cpu: "0.1"
             memory: "100M"
+        securityContext:
+          capabilities:
+            add: ["NET_RAW"]
       volumes:
       - name: config
         secret:
@@ -38,7 +42,6 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  creationTimestamp: null
   labels:
     app: cm-exporter
   name: cm-exporter
