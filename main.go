@@ -70,10 +70,12 @@ type Exporter struct {
 	dsChannelCodewordsNormal        *prometheus.Desc
 	dsChannelCodewordsCorrectable   *prometheus.Desc
 	dsChannelCodewordsUncorrectable *prometheus.Desc
+	dsChannelLocked                 *prometheus.Desc
 
 	// Upstream metrics.
 	usChannelPower      *prometheus.Desc
 	usChannelSymbolRate *prometheus.Desc
+	usChannelLocked     *prometheus.Desc
 }
 
 // NewExporter returns an instance of Exporter configured with the modem's
@@ -203,7 +205,11 @@ func NewExporter(addr, username, password string) *Exporter {
 			"Downstream channel uncorrectable errors.",
 			dsLabelNames, nil,
 		),
-
+		dsChannelLocked: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "downstream_channel", "locked"),
+			"Downstream channel is locked",
+			[]string{"serial", "mac", "type", "channel"}, nil,
+		),
 		// Upstream metrics.
 		usChannelPower: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "upstream_channel", "power_dbmv"),
@@ -214,6 +220,11 @@ func NewExporter(addr, username, password string) *Exporter {
 			prometheus.BuildFQName(namespace, "upstream_channel", "symbol_rate"),
 			"Upstream channel symbol rate per second",
 			usLabelNames, nil,
+		),
+		usChannelLocked: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "upstream_channel", "locked"),
+			"Upstream channel is locked",
+			[]string{"serial", "mac", "type", "channel"}, nil,
 		),
 	}
 }
@@ -241,9 +252,11 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.dsChannelCodewordsNormal
 	ch <- e.dsChannelCodewordsCorrectable
 	ch <- e.dsChannelCodewordsUncorrectable
+	ch <- e.dsChannelLocked
 	// Upstream metrics.
 	ch <- e.usChannelPower
 	ch <- e.usChannelSymbolRate
+	ch <- e.usChannelLocked
 }
 
 /*
@@ -550,6 +563,11 @@ func (e *Exporter) collectTableDownstream(kind string, elem *colly.HTMLElement, 
 		ch <- prometheus.MustNewConstMetric(e.dsChannelCodewordsNormal, prometheus.CounterValue, cwNormal, labels...)
 		ch <- prometheus.MustNewConstMetric(e.dsChannelCodewordsCorrectable, prometheus.CounterValue, cwCorrected, labels...)
 		ch <- prometheus.MustNewConstMetric(e.dsChannelCodewordsUncorrectable, prometheus.CounterValue, cwUncorrected, labels...)
+		var locked float64
+		if lockStatus == "Locked" {
+			locked = 1
+		}
+		ch <- prometheus.MustNewConstMetric(e.dsChannelLocked, prometheus.GaugeValue, locked, e.modemID.SerialNumber, e.modemID.MacAddress, kind, channel)
 	})
 	return ok
 }
@@ -593,6 +611,11 @@ func (e *Exporter) collectTableUpstream(kind string, elem *colly.HTMLElement, ch
 		labels := []string{e.modemID.SerialNumber, e.modemID.MacAddress, kind, channel, lockStatus, modulation, channelID, freqMHz}
 
 		ch <- prometheus.MustNewConstMetric(e.usChannelPower, prometheus.GaugeValue, power, labels...)
+		var locked float64
+		if lockStatus == "Locked" {
+			locked = 1
+		}
+		ch <- prometheus.MustNewConstMetric(e.usChannelLocked, prometheus.GaugeValue, locked, e.modemID.SerialNumber, e.modemID.MacAddress, kind, channel)
 	})
 	return ok
 }
