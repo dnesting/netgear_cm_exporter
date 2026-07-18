@@ -62,6 +62,12 @@ func (e *Exporter) pingLoop(interval, timeout, unreachableAt time.Duration) {
 			panic(err)
 		}
 
+		// Raw-socket mode: the default unprivileged UDP-ICMP mode needs the
+		// kernel's net.ipv4.ping_group_range to include our GID, which the
+		// default ("1 0") never does — and our hostNetwork pod can't set that
+		// sysctl. Privileged mode uses the CAP_NET_RAW the deployment grants.
+		pinger.SetPrivileged(true)
+
 		pinger.Count = 1
 		pinger.Interval = time.Second
 		pinger.Timeout = timeout
