@@ -452,7 +452,7 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 	// - Security --> security.enabled=1
 	// - IP Provisioning Mode --> ip_provisioning{mode=<status>}=1
 	ok := false
-	bootState := false
+
 	elem.DOM.Find("tr").Each(func(i int, row *goquery.Selection) {
 		if i == 0 {
 			return // head
@@ -474,23 +474,31 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			}
 		})
 		switch procedure {
-		case "Connectivity State":
+		case "Acquire Downstream Channel":
 			ok = true
+			value := 0.0
+			if status == "Locked" {
+				value = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(e.stateAcquired, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress)
+		case "Connectivity State":
 			value := 0.0
 			if status == "OK" {
 				value = 1.0
 			}
 			ch <- prometheus.MustNewConstMetric(e.stateConnected, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress)
 		case "Boot State":
-			if status == "OK" {
-				bootState = true
-			}
-		case "Configuration File":
 			value := 0.0
-			if bootState {
+			if status == "OK" {
 				value = 1.0
 			}
-			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, note)
+			ch <- prometheus.MustNewConstMetric(e.stateBooted, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress)
+		case "Configuration File":
+			value := 0.0
+			if status == "OK" {
+				value = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(e.stateConfigured, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, note)
 		case "Security":
 			value := 0.0
 			if status == "Enable" {
@@ -498,9 +506,30 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			}
 			ch <- prometheus.MustNewConstMetric(e.stateSecured, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, note)
 		case "IP Provisioning Mode":
-			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, 1.0, e.modemID.SerialNumber, e.modemID.MacAddress, status)
+			value := 0.0
+			if status != "In progress" {
+				value = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, status)
 		}
 	})
+// provisioning and cert still showed 1
+
+// Procedure	Status	Comment
+// Acquire Downstream Channel	0 Hz	In progress
+// Connectivity State	In progress	Not Ready
+// Boot State	In progress	Unknown
+// Security	In progress	BPI+
+// IP Provisioning Mode	In progress	Unknown
+
+// Acquire Downstream Channel	651000000 Hz	Locked
+// Connectivity State	OK	Operational
+// Boot State	OK	Operational
+// Security	Enable	BPI+
+// IP Provisioning Mode	Honor MDD	IPv6 only
+
+// ping up shows no (prob dashboard query)
+
 	return ok
 }
 
@@ -794,10 +823,12 @@ func (e *Exporter) retrieveModemInfo() (modemState ModemState, httpOk bool, err 
 		e.modemID.HwVersion = matches[1]
 		e.gotModemIDOnce.Do(func() {
 			close(e.gotModemID)
+			log.Printf("modem %s serial %s", e.modemID.MacAddress, e.modemID.SerialNumber)
 		})
 
 		modemState.SwVersion = matches[2]
 		modemState.CertInstalled = matches[4] == "Installed"
+
 
 		gotData = true
 	})

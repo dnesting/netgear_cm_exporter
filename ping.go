@@ -79,7 +79,7 @@ func (e *Exporter) pingLoop(interval, timeout, unreachableAt time.Duration) {
 				log.Printf("ping %s: %v", e.addr, err)
 			}
 			if !markedUnreachable && time.Since(errorStart) > unreachableAt {
-				e.pingUp.WithLabelValues(e.addr).Set(0)
+				e.pingUp.WithLabelValues(e.addr, e.modemID.SerialNumber, e.modemID.MacAddress).Set(0)
 				markedUnreachable = true
 				determined = true
 				log.Printf("ping %s: marking unreachable", e.addr)
