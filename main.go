@@ -56,8 +56,10 @@ type Exporter struct {
 	pingTime  *prometheus.GaugeVec
 
 	// State metrics
+	stateAcquired       *prometheus.Desc
 	stateConnected      *prometheus.Desc
 	stateBooted         *prometheus.Desc
+	stateConfigured     *prometheus.Desc
 	stateSecured        *prometheus.Desc
 	stateIPProvisioning *prometheus.Desc
 	stateCertInstalled  *prometheus.Desc
@@ -148,6 +150,11 @@ func NewExporter(addr, username, password string) *Exporter {
 		),
 
 		// State metrics
+		stateAcquired: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "state", "acquired"),
+			"The cable modem reports the downstream channel is acquired",
+			[]string{"serial", "mac"}, nil,
+		),
 		stateConnected: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "connected"),
 			"The cable modem reports being connected",
@@ -156,6 +163,11 @@ func NewExporter(addr, username, password string) *Exporter {
 		stateBooted: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "state", "booted"),
 			"The cable modem reports being booted",
+			[]string{"serial", "mac"}, nil,
+		),
+		stateConfigured: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "state", "configured"),
+			"The cable modem reports its configuration file is OK",
 			[]string{"serial", "mac", "file"}, nil,
 		),
 		stateSecured: prometheus.NewDesc(
@@ -240,8 +252,10 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	e.pingTimes.Describe(ch)
 	e.pingTime.Describe(ch)
 	// State metrics
+	ch <- e.stateAcquired
 	ch <- e.stateConnected
 	ch <- e.stateBooted
+	ch <- e.stateConfigured
 	ch <- e.stateSecured
 	ch <- e.stateIPProvisioning
 	ch <- e.stateCertInstalled
@@ -477,7 +491,9 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 		case "Acquire Downstream Channel":
 			ok = true
 			value := 0.0
-			if status == "Locked" {
+			// Some firmware puts the frequency in the Status column and
+			// "Locked" in the Comment column.
+			if status == "Locked" || note == "Locked" {
 				value = 1.0
 			}
 			ch <- prometheus.MustNewConstMetric(e.stateAcquired, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress)
@@ -513,22 +529,22 @@ func (e *Exporter) collectTableState(elem *colly.HTMLElement, ch chan<- promethe
 			ch <- prometheus.MustNewConstMetric(e.stateIPProvisioning, prometheus.GaugeValue, value, e.modemID.SerialNumber, e.modemID.MacAddress, status)
 		}
 	})
-// provisioning and cert still showed 1
+	// provisioning and cert still showed 1
 
-// Procedure	Status	Comment
-// Acquire Downstream Channel	0 Hz	In progress
-// Connectivity State	In progress	Not Ready
-// Boot State	In progress	Unknown
-// Security	In progress	BPI+
-// IP Provisioning Mode	In progress	Unknown
+	// Procedure	Status	Comment
+	// Acquire Downstream Channel	0 Hz	In progress
+	// Connectivity State	In progress	Not Ready
+	// Boot State	In progress	Unknown
+	// Security	In progress	BPI+
+	// IP Provisioning Mode	In progress	Unknown
 
-// Acquire Downstream Channel	651000000 Hz	Locked
-// Connectivity State	OK	Operational
-// Boot State	OK	Operational
-// Security	Enable	BPI+
-// IP Provisioning Mode	Honor MDD	IPv6 only
+	// Acquire Downstream Channel	651000000 Hz	Locked
+	// Connectivity State	OK	Operational
+	// Boot State	OK	Operational
+	// Security	Enable	BPI+
+	// IP Provisioning Mode	Honor MDD	IPv6 only
 
-// ping up shows no (prob dashboard query)
+	// ping up shows no (prob dashboard query)
 
 	return ok
 }
@@ -828,7 +844,6 @@ func (e *Exporter) retrieveModemInfo() (modemState ModemState, httpOk bool, err 
 
 		modemState.SwVersion = matches[2]
 		modemState.CertInstalled = matches[4] == "Installed"
-
 
 		gotData = true
 	})
